@@ -5,6 +5,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -19,7 +20,6 @@
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
-
 namespace mooncake {
 namespace testing {
 
@@ -1138,6 +1138,27 @@ TEST_F(RealClientTest, ErrGetNonExistentKey) {
         EXPECT_EQ(handles[i], nullptr)
             << "batch_get_buffer[" << i << "] should be nullptr";
     }
+}
+
+TEST_F(RealClientTest, GetBufferWithStatusDistinguishesUnavailableFromMissing) {
+    StartMasterAndSetupClient();
+    auto missing = py_client_->get_buffer_with_status("missing_status_key");
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    const std::string key = "get_status_after_master_stop";
+    const std::string value = "preserve the transient read error";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(
+        py_client_->put(key, std::span<const char>(value.data(), value.size()),
+                        config),
+        0);
+
+    master_.Stop();
+    auto unavailable = py_client_->get_buffer_with_status(key);
+    ASSERT_FALSE(unavailable);
+    EXPECT_NE(unavailable.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 // Get after remove

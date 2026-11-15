@@ -1172,9 +1172,23 @@ def get(self, key: str) -> bytes
 
 **Returns:**
 - `bytes`: Retrieved binary data
+- Empty bytes if the key doesn't exist.
 
 **Raises:**
-- Returns empty bytes if key doesn't exist
+- `StoreUnavailableError` (a `RuntimeError` subclass) for transient Store
+  availability errors such as `RPC_FAIL`, `UNAVAILABLE_IN_CURRENT_STATUS`, or
+  `REPLICA_IS_NOT_READY`. The exception explicitly says that the key's
+  existence is unknown and that the result is not a confirmed cache miss; a
+  master HA rebuild or failover may be in progress.
+- `StoreGetError` (a `RuntimeError` subclass) for other Store GET failures.
+- GET does not automatically retry. A transient availability error is
+  reported immediately as `StoreUnavailableError`; the caller decides whether
+  to retry or fall back.
+
+Both exception types inherit from `StoreError`, which inherits from
+`RuntimeError`, so existing `except RuntimeError` handlers continue to work.
+Callers can catch `StoreUnavailableError` separately to distinguish an
+unavailable/unknown key from a confirmed missing key.
 
 **Example:**
 
