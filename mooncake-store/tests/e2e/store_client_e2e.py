@@ -11,6 +11,19 @@ def make_payload(seq: int, size: int) -> bytes:
     return (seed * repeat)[:size]
 
 
+def result_exit_code(
+    put_ok: int, put_fail: int, get_ok: int, get_fail: int, mismatch: int
+) -> int:
+    """Return a failing status for any incomplete or incorrect I/O workload."""
+    if mismatch > 0:
+        return 20
+    if put_fail > 0 or get_fail > 0:
+        return 21
+    if put_ok == 0 or get_ok == 0:
+        return 22
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Continuous MooncakeDistributedStore put/get workload"
@@ -101,7 +114,9 @@ def main() -> int:
         f"get_ok={get_ok} get_fail={get_fail} mismatch={mismatch}",
         flush=True,
     )
-    return 0 if mismatch == 0 else 20
+    exit_code = result_exit_code(put_ok, put_fail, get_ok, get_fail, mismatch)
+    print(f"workload_exit_code {exit_code}", flush=True)
+    return exit_code
 
 
 if __name__ == "__main__":
