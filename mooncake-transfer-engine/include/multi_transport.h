@@ -30,6 +30,7 @@ class MultiTransport {
     using TransferRequest = Transport::TransferRequest;
     using TransferStatus = Transport::TransferStatus;
     using BatchDesc = Transport::BatchDesc;
+    using AbandonOutcome = Transport::AbandonOutcome;
 
     MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                    std::string &local_server_name);
@@ -58,6 +59,19 @@ class MultiTransport {
     // callback state can be released. retired is valid even on an error Status;
     // transfer/query failure alone never authorizes resource reuse.
     Status getBatchRetirementStatus(BatchID batch_id, bool &retired);
+
+    // Same as above plus a safety verdict: `quiescent` is false when the
+    // terminal state came from a give-up (timeout/abort not confirmed), so the
+    // caller must not release the batch's borrowed buffers.
+    Status getBatchRetirementStatus(BatchID batch_id, bool &retired,
+                                    bool &quiescent);
+
+    // Bounded attempt to stop a stalled batch. Only kQuiescentRecoverable
+    // publishes the terminal counts that let the caller free the batch;
+    // kQuiescentDeviceFault keeps the batch pending on purpose so the caller
+    // shuts the engine down instead of releasing buffers it cannot trust.
+    Status abandonBatch(BatchID batch_id, std::chrono::milliseconds timeout,
+                        AbandonOutcome &outcome);
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);

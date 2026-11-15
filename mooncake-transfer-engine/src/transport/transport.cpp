@@ -61,6 +61,22 @@ Status Transport::freeBatchID(BatchID batch_id) {
     return Status::OK();
 }
 
+bool Transport::isBatchQuiescent(BatchID batch_id) {
+    (void)batch_id;
+    // Legacy: terminal counters are the only signal available.
+    return true;
+}
+
+Status Transport::abandonBatch(BatchID batch_id,
+                               std::chrono::milliseconds timeout,
+                               AbandonOutcome &outcome) {
+    (void)batch_id;
+    (void)timeout;
+    outcome = AbandonOutcome::kNotQuiescent;
+    return Status::NotImplemented(
+        "Transport::abandonBatch is not implemented");
+}
+
 int Transport::install(std::string &local_server_name,
                        std::shared_ptr<TransferMetadata> meta,
                        std::shared_ptr<Topology> topo) {

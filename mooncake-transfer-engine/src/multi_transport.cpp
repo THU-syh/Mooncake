@@ -319,6 +319,89 @@ Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
     return result;
 }
 
+Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
+                                                bool &retired,
+                                                bool &quiescent) {
+    const Status status = getBatchRetirementStatus(batch_id, retired);
+    quiescent = retired;
+    if (retired) {
+        auto &batch = Transport::toBatchDesc(batch_id);
+        for (auto &task : batch.task_list) {
+            if (task.transport_ == nullptr) continue;
+            if (!task.transport_->isBatchQuiescent(batch_id)) {
+                quiescent = false;
+                break;
+            }
+        }
+    }
+    return status;
+}
+
+Status MultiTransport::abandonBatch(BatchID batch_id,
+                                    std::chrono::milliseconds timeout,
+                                    AbandonOutcome &outcome) {
+    auto &batch = Transport::toBatchDesc(batch_id);
+    outcome = AbandonOutcome::kQuiescentRecoverable;
+
+    // Collect the transports that still own unfinished tasks of this batch.
+    std::vector<Transport *> pending;
+    for (auto &task : batch.task_list) {
+        const uint64_t count =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t succeeded =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (succeeded + failed == count) continue;
+        if (task.transport_ == nullptr) {
+            // No transport to ask: the batch can never be proven quiescent.
+            outcome = AbandonOutcome::kNotQuiescent;
+            return Status::OK();
+        }
+        if (std::find(pending.begin(), pending.end(), task.transport_) ==
+            pending.end()) {
+            pending.push_back(task.transport_);
+        }
+    }
+
+    Status result = Status::OK();
+    for (auto *transport : pending) {
+        AbandonOutcome local = AbandonOutcome::kNotQuiescent;
+        const Status status = transport->abandonBatch(batch_id, timeout, local);
+        if (!status.ok()) {
+            // The transport cannot stop this batch: no safety proof.
+            outcome = AbandonOutcome::kNotQuiescent;
+            return status;
+        }
+        if (local == AbandonOutcome::kQuiescentDeviceFault) {
+            outcome = local;
+        } else if (local == AbandonOutcome::kNotQuiescent &&
+                   outcome == AbandonOutcome::kQuiescentRecoverable) {
+            outcome = local;
+        }
+    }
+
+    if (outcome == AbandonOutcome::kQuiescentRecoverable) {
+        // The transport proved that the batch is stopped, so publishing the
+        // terminal counts is safe and lets the caller free the batch.
+        for (auto &task : batch.task_list) {
+            const uint64_t count =
+                __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+            const uint64_t succeeded =
+                __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+            const uint64_t failed =
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+            if (succeeded + failed < count) {
+                __atomic_add_fetch(&task.failed_slice_count,
+                                   count - succeeded - failed,
+                                   __ATOMIC_ACQ_REL);
+            }
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        }
+    }
+    return result;
+}
+
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     auto& batch_desc = *((BatchDesc*)(batch_id));

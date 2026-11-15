@@ -216,6 +216,11 @@ void AsyncTransferExecutor::markBatchFailed(QueryBatch& batch,
         LOG(ERROR) << reason;
     }
     for (auto* slice : batch.slices) {
+        // A submitted ADXL operation has no cancel path: its timeout/failure
+        // publication is a give-up, not proof that the buffers are idle.
+        if (slice->ascend_direct.handle != nullptr) {
+            slice->ascend_direct.unsafe_terminal = true;
+        }
         slice->markFailed();
     }
     handleTaskFinished();

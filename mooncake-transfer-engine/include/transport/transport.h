@@ -27,6 +27,7 @@
 #include <queue>
 #include <string>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <condition_variable>
@@ -78,6 +79,16 @@ class Transport {
         COMPLETED,
         TIMEOUT,
         FAILED
+    };
+
+    // Result of a bounded attempt to stop a stalled batch. kQuiescent* means
+    // the transport confirmed that it will not access the batch's borrowed
+    // buffers again; kNotQuiescent means no such proof exists and the caller
+    // must keep waiting (returning without it reintroduces a use-after-free).
+    enum class AbandonOutcome {
+        kQuiescentRecoverable,
+        kQuiescentDeviceFault,
+        kNotQuiescent,
     };
 
     struct TransferStatus {
@@ -178,6 +189,10 @@ class Transport {
                 void *handle;
                 int64_t start_time;
                 int32_t engine_id;
+                // Set when the terminal state came from a timeout/abort that
+                // could not prove the transfer stopped. Such a slice must never
+                // be treated as safe to release.
+                bool unsafe_terminal;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;
@@ -391,6 +406,18 @@ class Transport {
 
     /// @brief Free an allocated batch.
     virtual Status freeBatchID(BatchID batch_id);
+
+    /// @brief Stop a stalled batch and report whether its buffers are safe to
+    /// release. Implementations must only report kQuiescent* when they can
+    /// prove that no transfer access is in flight any more.
+    virtual Status abandonBatch(BatchID batch_id,
+                                std::chrono::milliseconds timeout,
+                                AbandonOutcome& outcome);
+
+    /// @brief Whether a retired batch is provably idle (no in-flight access).
+    /// Transports that publish terminal state on give-up/timeout must override
+    /// this and return false for those batches.
+    virtual bool isBatchQuiescent(BatchID batch_id);
 
     /// @brief Submit a batch of transfer requests to the batch.
     /// @return The number of successfully submitted transfers on success. If

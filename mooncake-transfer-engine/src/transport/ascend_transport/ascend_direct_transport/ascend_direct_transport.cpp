@@ -283,6 +283,16 @@ Status AscendDirectTransport::submitTransferTask(
     return Status::OK();
 }
 
+bool AscendDirectTransport::isBatchQuiescent(BatchID batch_id) {
+    auto &batch_desc = *((BatchDesc *)(batch_id));
+    for (auto &task : batch_desc.task_list) {
+        for (auto *slice : task.slice_list) {
+            if (slice->ascend_direct.unsafe_terminal) return false;
+        }
+    }
+    return true;
+}
+
 // actually not called, just use getTransferStatus in multi_transport
 Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
                                                 size_t task_id,

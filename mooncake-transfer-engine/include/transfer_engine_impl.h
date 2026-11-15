@@ -52,6 +52,7 @@ using SegmentHandle = Transport::SegmentHandle;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
+using AbandonOutcome = Transport::AbandonOutcome;
 
 #ifdef ENABLE_MULTI_PROTOCOL
 using RegisteredBuffer = TransferEngine::RegisteredBuffer;
@@ -324,6 +325,17 @@ class TransferEngineImpl {
     // though MultiTransport already implements the check.
     Status getBatchRetirementStatus(BatchID batch_id, bool& retired) {
         return multi_transports_->getBatchRetirementStatus(batch_id, retired);
+    }
+
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired,
+                                    bool& quiescent) {
+        return multi_transports_->getBatchRetirementStatus(batch_id, retired,
+                                                           quiescent);
+    }
+
+    Status abandonBatch(BatchID batch_id, std::chrono::milliseconds timeout,
+                        AbandonOutcome& outcome) {
+        return multi_transports_->abandonBatch(batch_id, timeout, outcome);
     }
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status,
