@@ -97,6 +97,13 @@ class Transport {
         FAILED
     };
 
+    // Outcome of a bounded attempt to stop a stalled batch.
+    enum class AbandonOutcome {
+        kQuiescentRecoverable,
+        kQuiescentDeviceFault,
+        kNotQuiescent,
+    };
+
     struct TransferStatus {
         TransferStatusEnum s;
         size_t transferred_bytes;
@@ -591,6 +598,11 @@ class Transport {
     /// the caller must retry then. MultiTransport wraps this with a deferred
     /// cleanup thread so engine callers see BatchCleanupDeferred instead.
     virtual Status freeBatchID(BatchID batch_id);
+
+    virtual Status abandonBatch(BatchID batch_id,
+                                std::chrono::milliseconds timeout,
+                                AbandonOutcome& outcome);
+    virtual bool isBatchQuiescent(BatchID batch_id);
 
     /// @brief Submit a batch of transfer requests to the batch.
     /// @return The number of successfully submitted transfers on success. If

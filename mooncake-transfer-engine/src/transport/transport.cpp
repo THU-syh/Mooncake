@@ -73,6 +73,14 @@ Status Transport::freeBatchID(BatchID batch_id) {
     return Status::OK();
 }
 
+Status Transport::abandonBatch(BatchID, std::chrono::milliseconds,
+                               AbandonOutcome& outcome) {
+    outcome = AbandonOutcome::kNotQuiescent;
+    return Status::NotImplemented("Transport::abandonBatch is not implemented");
+}
+
+bool Transport::isBatchQuiescent(BatchID) { return true; }
+
 int Transport::install(std::string &local_server_name,
                        std::shared_ptr<TransferMetadata> meta,
                        std::shared_ptr<Topology> topo) {

@@ -623,6 +623,66 @@ Status MultiTransport::getScatterRequestStatuses(
     return Status::OK();
 }
 
+Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    auto& batch = Transport::toBatchDesc(batch_id);
+    retired = true;
+    Status result = Status::OK();
+    for (size_t index = 0; index < batch.task_list.size(); ++index) {
+        auto& task = batch.task_list[index];
+        const uint64_t count =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        uint64_t succeeded =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (failed != count - succeeded) retired = false;
+    }
+    retired = retired && batch.active_completion_callbacks.load(
+                             std::memory_order_acquire) == 0;
+    return result;
+}
+
+Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired,
+                                                bool& quiescent) {
+    const Status status = getBatchRetirementStatus(batch_id, retired);
+    quiescent = retired;
+    if (retired) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        for (auto& task : batch.task_list) {
+            if (task.transport_ == nullptr) continue;
+            if (!task.transport_->isBatchQuiescent(batch_id)) {
+                quiescent = false;
+                break;
+            }
+        }
+    }
+    return status;
+}
+
+Status MultiTransport::abandonBatch(BatchID batch_id,
+                                    std::chrono::milliseconds,
+                                    AbandonOutcome& outcome) {
+    auto& batch = Transport::toBatchDesc(batch_id);
+    outcome = AbandonOutcome::kNotQuiescent;
+    bool all_terminal = true;
+    for (auto& task : batch.task_list) {
+        const uint64_t count =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t succeeded =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (failed != count - succeeded) all_terminal = false;
+    }
+    if (all_terminal &&
+        batch.active_completion_callbacks.load(std::memory_order_acquire) == 0) {
+        outcome = AbandonOutcome::kQuiescentRecoverable;
+    }
+    return Status::OK();
+}
+
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
