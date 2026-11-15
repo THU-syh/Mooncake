@@ -117,6 +117,14 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 
+# Hardware-free unit tests for the batch retirement contract: the
+# TransferEngineImpl forwarding layer, the MultiTransport drain/callback checks
+# and the Transport completion-callback gate. No transport device is required.
+add_executable(batch_retirement_test ${WORKSPACE}/batch_retirement_test.cpp)
+target_link_libraries(batch_retirement_test PUBLIC transfer_engine gtest
+                                                    gtest_main)
+add_test(NAME batch_retirement_test COMMAND batch_retirement_test)
+
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest

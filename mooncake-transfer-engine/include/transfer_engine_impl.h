@@ -318,6 +318,14 @@ class TransferEngineImpl {
         return result;
     }
 
+    // Drives unfinished classic tasks and reports whether borrowed buffers
+    // and completion callbacks may be released. The public TransferEngine
+    // facade forwards here, so this middle layer must not be skipped even
+    // though MultiTransport already implements the check.
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired) {
+        return multi_transports_->getBatchRetirementStatus(batch_id, retired);
+    }
+
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status,
                                   bool skip_metrics = false) {
         Status result =

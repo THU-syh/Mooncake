@@ -274,7 +274,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
                                                 bool& retired) {
-    auto& batch = toBatchDesc(batch_id);
+    auto& batch = Transport::toBatchDesc(batch_id);
     retired = true;
     Status result = Status::OK();
     for (size_t index = 0; index < batch.task_list.size(); ++index) {
