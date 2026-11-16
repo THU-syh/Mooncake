@@ -108,6 +108,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    stop_retirement_reaper();
     detachShutdownToken(shutdown_token_);
     if (impl_) {
         impl_->freeEngine();
@@ -252,8 +253,8 @@ Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
     return impl_->getBatchRetirementStatus(batch_id, retired);
 }
 
-Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
-                                                bool& retired, bool& quiescent) {
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id, bool& retired,
+                                                bool& quiescent) {
     return impl_->getBatchRetirementStatus(batch_id, retired, quiescent);
 }
 
@@ -482,6 +483,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    stop_retirement_reaper();
     detachShutdownToken(shutdown_token_);
     if (!use_tent_ && impl_) {
         impl_->freeEngine();
@@ -803,8 +805,7 @@ Status TransferEngine::abandonBatch(BatchID batch_id,
     return Status::NotImplemented("TENT does not expose batch quiescence");
 }
 
-Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
-                                                bool& retired,
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id, bool& retired,
                                                 bool& quiescent) {
     if (!use_tent_) {
         return impl_->getBatchRetirementStatus(batch_id, retired, quiescent);

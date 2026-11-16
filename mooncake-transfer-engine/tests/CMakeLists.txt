@@ -123,6 +123,9 @@ add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 add_executable(batch_retirement_test ${WORKSPACE}/batch_retirement_test.cpp)
 target_link_libraries(batch_retirement_test PUBLIC transfer_engine gtest
                                                     gtest_main)
+# The asynchronous reaper is an internal header under src/.
+target_include_directories(batch_retirement_test
+                           PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/src)
 add_test(NAME batch_retirement_test COMMAND batch_retirement_test)
 
 if(USE_MNNVL)

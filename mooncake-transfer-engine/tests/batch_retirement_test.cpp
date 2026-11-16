@@ -16,10 +16,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "batch_retirement_reaper.h"
 #include "multi_transport.h"
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
@@ -193,9 +195,9 @@ class SubmittedBatchFixture {
 TEST(BatchRetirementTest, PublicApiReportsRetiredEmptyBatch) {
     TransferEngine engine(false);
     if (engine.init(P2PHANDSHAKE, "127.0.0.1:12345") != 0) {
-      // A transport such as AscendDirect needs a usable ACL context;
-      // this exercise only makes sense where the facade can initialise.
-      GTEST_SKIP() << "no usable transport in this environment";
+        // A transport such as AscendDirect needs a usable ACL context;
+        // this exercise only makes sense where the facade can initialise.
+        GTEST_SKIP() << "no usable transport in this environment";
     }
 
     const BatchID batch_id = engine.allocateBatchID(1);
@@ -358,7 +360,8 @@ TEST(BatchRetirementTest, AbandonRecoverablePublishesTerminalState) {
     const BatchID batch_id = transports.allocateBatchID(1);
     ASSERT_TRUE(probe->submitTransfer(batch_id, makeRequests(2)).ok());
 
-    Transport::AbandonOutcome outcome = Transport::AbandonOutcome::kNotQuiescent;
+    Transport::AbandonOutcome outcome =
+        Transport::AbandonOutcome::kNotQuiescent;
     const Status status = transports.abandonBatch(
         batch_id, std::chrono::milliseconds(50), outcome);
     EXPECT_TRUE(status.ok()) << status.ToString();
@@ -387,7 +390,8 @@ TEST(BatchRetirementTest, AbandonDeviceFaultKeepsBatchPending) {
     const BatchID batch_id = transports.allocateBatchID(1);
     ASSERT_TRUE(probe->submitTransfer(batch_id, makeRequests(2)).ok());
 
-    Transport::AbandonOutcome outcome = Transport::AbandonOutcome::kNotQuiescent;
+    Transport::AbandonOutcome outcome =
+        Transport::AbandonOutcome::kNotQuiescent;
     const Status status = transports.abandonBatch(
         batch_id, std::chrono::milliseconds(50), outcome);
     EXPECT_TRUE(status.ok()) << status.ToString();
@@ -416,7 +420,8 @@ TEST(BatchRetirementTest, AbandonUnsupportedTransportKeepsBatchPending) {
     const BatchID batch_id = transports.allocateBatchID(1);
     ASSERT_TRUE(probe->submitTransfer(batch_id, makeRequests(2)).ok());
 
-    Transport::AbandonOutcome outcome = Transport::AbandonOutcome::kQuiescentRecoverable;
+    Transport::AbandonOutcome outcome =
+        Transport::AbandonOutcome::kQuiescentRecoverable;
     const Status status = transports.abandonBatch(
         batch_id, std::chrono::milliseconds(50), outcome);
     EXPECT_FALSE(status.ok());
@@ -471,6 +476,216 @@ TEST(BatchRetirementTest, QuiescentRetirementIsReported) {
     EXPECT_TRUE(retired);
     EXPECT_TRUE(quiescent);
     EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+// The asynchronous reaper must release buffers only after the transport
+// proved quiescence, and must not invoke the callback before that point.
+TEST(BatchRetirementTest, AsyncReleasesOnlyAfterQuiescentRetirement) {
+    std::atomic<int> queries{0};
+    std::atomic<int> frees{0};
+    std::atomic<bool> released{false};
+    std::promise<BatchRetirementState> done;
+    BatchRetirementOptions options;
+    options.abandon_delay = std::chrono::seconds(10);
+    options.deadline = std::chrono::seconds(5);
+
+    BatchRetirementReaper reaper(
+        [&](BatchID, bool& retired, bool& quiescent) {
+            retired = ++queries >= 3;
+            quiescent = true;
+            return Status::OK();
+        },
+        [](BatchID, std::chrono::milliseconds,
+           Transport::AbandonOutcome& outcome) {
+            outcome = Transport::AbandonOutcome::kNotQuiescent;
+            return Status::OK();
+        },
+        [&](BatchID) {
+            ++frees;
+            return Status::OK();
+        });
+
+    ASSERT_TRUE(reaper
+                    .enqueue(7, options,
+                             [&](BatchID, const Status& status,
+                                 BatchRetirementState state) {
+                                 EXPECT_TRUE(status.ok()) << status.ToString();
+                                 released = true;
+                                 done.set_value(state);
+                             })
+                    .ok());
+    EXPECT_FALSE(released.load());
+    auto future = done.get_future();
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(future.get(), BatchRetirementState::kSafeToRelease);
+    EXPECT_EQ(frees.load(), 1);
+}
+
+// A caller that already saw a failure asks for an immediate abandon; a
+// recoverable outcome must still end in a safe release.
+TEST(BatchRetirementTest, AsyncAbandonsImmediatelyAndReleases) {
+    std::atomic<bool> abandoned{false};
+    std::atomic<int> abandons{0};
+    std::atomic<int> frees{0};
+    std::promise<BatchRetirementState> done;
+    BatchRetirementOptions options;
+    options.abandon_delay = std::chrono::milliseconds(0);
+    options.abandon_timeout = std::chrono::milliseconds(10);
+    options.deadline = std::chrono::seconds(2);
+
+    BatchRetirementReaper reaper(
+        [&](BatchID, bool& retired, bool& quiescent) {
+            retired = abandoned.load();
+            quiescent = true;
+            return Status::OK();
+        },
+        [&](BatchID, std::chrono::milliseconds,
+            Transport::AbandonOutcome& outcome) {
+            ++abandons;
+            abandoned = true;
+            outcome = Transport::AbandonOutcome::kQuiescentRecoverable;
+            return Status::OK();
+        },
+        [&](BatchID) {
+            ++frees;
+            return Status::OK();
+        });
+
+    ASSERT_TRUE(
+        reaper
+            .enqueue(8, options,
+                     [&](BatchID, const Status&, BatchRetirementState state) {
+                         done.set_value(state);
+                     })
+            .ok());
+    auto future = done.get_future();
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(future.get(), BatchRetirementState::kSafeToRelease);
+    EXPECT_EQ(abandons.load(), 1);
+    EXPECT_EQ(frees.load(), 1);
+}
+
+// A device fault means the transport cannot stop the batch: the callback must
+// report kUnrecoverable and nothing may be freed.
+TEST(BatchRetirementTest, AsyncDeviceFaultDoesNotRelease) {
+    std::atomic<int> frees{0};
+    std::promise<BatchRetirementState> done;
+    BatchRetirementOptions options;
+    options.abandon_delay = std::chrono::milliseconds(0);
+    options.abandon_timeout = std::chrono::milliseconds(10);
+    options.deadline = std::chrono::seconds(5);
+
+    BatchRetirementReaper reaper(
+        [](BatchID, bool& retired, bool& quiescent) {
+            retired = false;
+            quiescent = true;
+            return Status::OK();
+        },
+        [](BatchID, std::chrono::milliseconds,
+           Transport::AbandonOutcome& outcome) {
+            outcome = Transport::AbandonOutcome::kQuiescentDeviceFault;
+            return Status::OK();
+        },
+        [&](BatchID) {
+            ++frees;
+            return Status::OK();
+        });
+
+    ASSERT_TRUE(
+        reaper
+            .enqueue(9, options,
+                     [&](BatchID, const Status&, BatchRetirementState state) {
+                         done.set_value(state);
+                     })
+            .ok());
+    auto future = done.get_future();
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(future.get(), BatchRetirementState::kUnrecoverable);
+    EXPECT_EQ(frees.load(), 0);
+}
+
+// Without a quiescence proof the deadline turns into a fail-closed answer
+// instead of an unbounded wait.
+TEST(BatchRetirementTest, AsyncDeadlineIsUnrecoverable) {
+    std::atomic<int> frees{0};
+    std::promise<BatchRetirementState> done;
+    BatchRetirementOptions options;
+    options.abandon_delay = std::chrono::milliseconds(0);
+    options.abandon_timeout = std::chrono::milliseconds(10);
+    options.deadline = std::chrono::milliseconds(100);
+
+    BatchRetirementReaper reaper(
+        [](BatchID, bool& retired, bool& quiescent) {
+            retired = false;
+            quiescent = true;
+            return Status::OK();
+        },
+        [](BatchID, std::chrono::milliseconds,
+           Transport::AbandonOutcome& outcome) {
+            outcome = Transport::AbandonOutcome::kNotQuiescent;
+            return Status::OK();
+        },
+        [&](BatchID) {
+            ++frees;
+            return Status::OK();
+        });
+
+    ASSERT_TRUE(
+        reaper
+            .enqueue(10, options,
+                     [&](BatchID, const Status&, BatchRetirementState state) {
+                         done.set_value(state);
+                     })
+            .ok());
+    auto future = done.get_future();
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(future.get(), BatchRetirementState::kUnrecoverable);
+    EXPECT_EQ(frees.load(), 0);
+}
+
+// A quarantined batch must not delay the retirement of later batches: the
+// submission path returns as soon as the batch is enqueued.
+TEST(BatchRetirementTest, AsyncQuarantinedBatchDoesNotBlockLaterBatches) {
+    std::promise<BatchID> done;
+    std::atomic<bool> stuck_done{false};
+    BatchRetirementOptions options;
+    options.abandon_delay = std::chrono::seconds(10);
+    options.deadline = std::chrono::seconds(10);
+
+    BatchRetirementReaper reaper(
+        [](BatchID batch_id, bool& retired, bool& quiescent) {
+            retired = batch_id != 11;
+            quiescent = true;
+            return Status::OK();
+        },
+        [](BatchID, std::chrono::milliseconds,
+           Transport::AbandonOutcome& outcome) {
+            outcome = Transport::AbandonOutcome::kNotQuiescent;
+            return Status::OK();
+        },
+        [](BatchID) { return Status::OK(); });
+
+    ASSERT_TRUE(reaper
+                    .enqueue(11, options,
+                             [&](BatchID, const Status&, BatchRetirementState) {
+                                 stuck_done = true;
+                             })
+                    .ok());
+    ASSERT_TRUE(
+        reaper
+            .enqueue(12, options,
+                     [&](BatchID batch_id, const Status&,
+                         BatchRetirementState) { done.set_value(batch_id); })
+            .ok());
+    auto future = done.get_future();
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(future.get(), 12);
+    EXPECT_FALSE(stuck_done.load());
 }
 
 }  // namespace mooncake

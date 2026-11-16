@@ -17,12 +17,14 @@
 
 #include <memory>
 
+#include "batch_retirement.h"
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+class BatchRetirementReaper;
 class ShutdownToken;
 class TransferEngineImpl;
 namespace tent {
@@ -180,6 +182,15 @@ class TransferEngine {
     Status abandonBatch(BatchID batch_id, std::chrono::milliseconds timeout,
                         Transport::AbandonOutcome& outcome);
 
+    // Drives a quarantined batch to a terminal state on a dedicated reaper
+    // thread and invokes `callback` exactly once. Returns as soon as the batch
+    // is enqueued so the caller (and its transfer submission thread) can move
+    // on; the callback reports whether the buffers may be released or the
+    // owner must fail closed.
+    Status retireBatchAsync(BatchID batch_id,
+                            const BatchRetirementOptions& options,
+                            BatchRetirementCallback callback);
+
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);
@@ -225,10 +236,17 @@ class TransferEngine {
     std::string showLinks(bool json = false) const;
 
    private:
+    // Defined where BatchRetirementReaper is complete; called from freeEngine()
+    // in both build variants.
+    void stop_retirement_reaper();
+
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     bool use_tent_{false};
+    // Declared last so it is destroyed first: the reaper thread must stop
+    // before the transports and segments it queries are torn down.
+    std::shared_ptr<BatchRetirementReaper> retirement_reaper_;
 };
 }  // namespace mooncake
 
