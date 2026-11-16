@@ -700,6 +700,10 @@ void TransferExecutorBase::processSliceList(
     if (result.status == adxl::TIMEOUT) {
         LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
                    << ", errmsg: " << aclGetRecentErrMsg();
+        // The synchronous transfer timed out without a cancellation proof.
+        for (auto* slice : slice_list) {
+            slice->ascend_direct.unsafe_terminal = true;
+        }
     } else {
         LOG(ERROR) << "Transfer failed to: " << target_adxl_engine_name
                    << ", errmsg: " << aclGetRecentErrMsg();

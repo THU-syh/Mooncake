@@ -165,6 +165,21 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+    // Drives all unfinished tasks and reports whether borrowed buffers and
+    // callback state can be released. retired is valid even on an error Status;
+    // transfer/query failure alone never authorizes resource reuse.
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired);
+
+    // Same as above plus a safety verdict: `quiescent` is false when the
+    // terminal state came from a give-up, so borrowed buffers must not be
+    // released. Callers must not free a retired but non-quiescent batch.
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired,
+                                    bool& quiescent);
+
+    // Bounded attempt to stop a stalled batch. See Transport::AbandonOutcome.
+    Status abandonBatch(BatchID batch_id, std::chrono::milliseconds timeout,
+                        Transport::AbandonOutcome& outcome);
+
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);

@@ -50,6 +50,10 @@ class AscendDirectTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
+    // False when any slice of the batch was failed by a give-up path whose
+    // in-flight ADXL operation could not be cancelled or drained.
+    bool isBatchQuiescent(BatchID batch_id) override;
+
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo) override;

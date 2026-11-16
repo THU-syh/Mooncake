@@ -96,6 +96,13 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
+    bool retired = false;
+    auto status = getBatchRetirementStatus(batch_id, retired);
+    if (!retired) {
+        return Status::BatchBusy("Batch tasks or callbacks are pending: " +
+                                 status.ToString());
+    }
+    // A transfer/query error does not prevent cleanup after retirement.
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -254,7 +261,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         } else {
             status.s = Transport::TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         if (checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
@@ -263,6 +270,136 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         }
     }
     return Status::OK();
+}
+
+Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    auto& batch = Transport::toBatchDesc(batch_id);
+    retired = true;
+    Status result = Status::OK();
+    for (size_t index = 0; index < batch.task_list.size(); ++index) {
+        auto& task = batch.task_list[index];
+        const uint64_t count =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        uint64_t succeeded =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (succeeded > count || failed != count - succeeded) {
+            TransferStatus status;
+            auto queried = getTransferStatus(batch_id, index, status);
+            if (result.ok() && !queried.ok()) {
+                result = queried;
+            } else if (result.ok() &&
+                       (status.s == Transport::TransferStatusEnum::FAILED ||
+                        status.s == Transport::TransferStatusEnum::TIMEOUT ||
+                        status.s == Transport::TransferStatusEnum::CANCELED)) {
+                result =
+                    Status::Context("Transfer task failed, state=" +
+                                    std::to_string(static_cast<int>(status.s)));
+            }
+            succeeded =
+                __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+            failed =
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        }
+        if (succeeded > count || failed != count - succeeded) retired = false;
+        if (result.ok() && failed != 0) {
+            result = Status::Context("Transfer task failed: " +
+                                     std::to_string(index));
+        }
+    }
+    retired = retired && batch.active_completion_callbacks.load(
+                             std::memory_order_acquire) == 0;
+    if (retired) {
+        for (auto& task : batch.task_list) {
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        }
+    }
+    return result;
+}
+
+Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
+                                                bool &retired,
+                                                bool &quiescent) {
+    const Status status = getBatchRetirementStatus(batch_id, retired);
+    quiescent = retired;
+    if (retired) {
+        auto &batch = Transport::toBatchDesc(batch_id);
+        for (auto &task : batch.task_list) {
+            if (task.transport_ == nullptr) continue;
+            if (!task.transport_->isBatchQuiescent(batch_id)) {
+                quiescent = false;
+                break;
+            }
+        }
+    }
+    return status;
+}
+
+Status MultiTransport::abandonBatch(BatchID batch_id,
+                                    std::chrono::milliseconds timeout,
+                                    AbandonOutcome &outcome) {
+    auto &batch = Transport::toBatchDesc(batch_id);
+    outcome = AbandonOutcome::kQuiescentRecoverable;
+
+    // Collect the transports that still own unfinished tasks of this batch.
+    std::vector<Transport *> pending;
+    for (auto &task : batch.task_list) {
+        const uint64_t count =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t succeeded =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (succeeded + failed == count) continue;
+        if (task.transport_ == nullptr) {
+            // No transport to ask: the batch can never be proven quiescent.
+            outcome = AbandonOutcome::kNotQuiescent;
+            return Status::OK();
+        }
+        if (std::find(pending.begin(), pending.end(), task.transport_) ==
+            pending.end()) {
+            pending.push_back(task.transport_);
+        }
+    }
+
+    Status result = Status::OK();
+    for (auto *transport : pending) {
+        AbandonOutcome local = AbandonOutcome::kNotQuiescent;
+        const Status status = transport->abandonBatch(batch_id, timeout, local);
+        if (!status.ok()) {
+            // The transport cannot stop this batch: no safety proof.
+            outcome = AbandonOutcome::kNotQuiescent;
+            return status;
+        }
+        if (local == AbandonOutcome::kQuiescentDeviceFault) {
+            outcome = local;
+        } else if (local == AbandonOutcome::kNotQuiescent &&
+                   outcome == AbandonOutcome::kQuiescentRecoverable) {
+            outcome = local;
+        }
+    }
+
+    if (outcome == AbandonOutcome::kQuiescentRecoverable) {
+        // The transport proved that the batch is stopped, so publishing the
+        // terminal counts is safe and lets the caller free the batch.
+        for (auto &task : batch.task_list) {
+            const uint64_t count =
+                __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+            const uint64_t succeeded =
+                __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+            const uint64_t failed =
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+            if (succeeded + failed < count) {
+                __atomic_add_fetch(&task.failed_slice_count,
+                                   count - succeeded - failed,
+                                   __ATOMIC_ACQ_REL);
+            }
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        }
+    }
+    return result;
 }
 
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,

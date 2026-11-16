@@ -284,6 +284,9 @@ void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
         LOG(ERROR) << "Memory copy failed, ret:" << ret;
         (void)aclrtStreamAbort(stream_);
         for (auto &slice : async_list) {
+            // The abort is not proven to have taken effect; the slice must not
+            // be treated as safe to release.
+            slice->ascend_direct.unsafe_terminal = true;
             slice->markFailed();
         }
     }

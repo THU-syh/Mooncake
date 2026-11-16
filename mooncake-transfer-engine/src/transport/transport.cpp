@@ -49,12 +49,32 @@ Status Transport::freeBatchID(BatchID batch_id) {
                 "BatchID cannot be freed until all tasks are done");
         }
     }
+    if (batch_desc.active_completion_callbacks.load(
+            std::memory_order_acquire) != 0) {
+        return Status::BatchBusy("Completion callbacks are pending");
+    }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
 #endif
     return Status::OK();
+}
+
+bool Transport::isBatchQuiescent(BatchID batch_id) {
+    (void)batch_id;
+    // Legacy: terminal counters are the only signal available.
+    return true;
+}
+
+Status Transport::abandonBatch(BatchID batch_id,
+                               std::chrono::milliseconds timeout,
+                               AbandonOutcome &outcome) {
+    (void)batch_id;
+    (void)timeout;
+    outcome = AbandonOutcome::kNotQuiescent;
+    return Status::NotImplemented(
+        "Transport::abandonBatch is not implemented");
 }
 
 int Transport::install(std::string &local_server_name,
