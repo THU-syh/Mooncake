@@ -280,6 +280,16 @@ class RealClient : public PyClient {
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     /**
+     * @brief Get a buffer and preserve the Store error on failure.
+     *
+     * Unlike get_buffer(), this distinguishes a missing object from transient
+     * master/rebuild errors. HA rebuild clients retry transient errors for the
+     * configured timeout before returning the last error.
+     */
+    tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>
+    get_buffer_with_status(const std::string &key);
+
+    /**
      * @brief Get buffers containing the data for multiple keys (batch version)
      * @param keys Vector of keys to get data for
      * @return Vector of std::shared_ptr<BufferHandle> buffers containing the
@@ -664,7 +674,8 @@ class RealClient : public PyClient {
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        ErrorCode *failure_reason = nullptr);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,
