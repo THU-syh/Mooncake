@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -100,6 +101,36 @@ class RetirementProbeTransport : public Transport {
     Status query_status_;
     TransferStatusEnum reported_status_ = TransferStatusEnum::WAITING;
     int query_count_ = 0;
+};
+
+// Probe transport that reports an unsafe (give-up) terminal state.
+class NonQuiescentProbeTransport : public RetirementProbeTransport {
+   public:
+    bool isBatchQuiescent(BatchID) override { return false; }
+};
+
+// Probe transport that can claim a bounded stop, so the abandon contract can
+// be tested without hardware.
+class AbandonProbeTransport : public RetirementProbeTransport {
+   public:
+    Status abandonBatch(BatchID, std::chrono::milliseconds,
+                        AbandonOutcome& outcome) override {
+        ++abandon_calls_;
+        outcome = abandon_outcome_;
+        return abandon_status_;
+    }
+
+    void setAbandonResult(Status status, AbandonOutcome outcome) {
+        abandon_status_ = std::move(status);
+        abandon_outcome_ = outcome;
+    }
+
+    int abandonCalls() const { return abandon_calls_; }
+
+   private:
+    Status abandon_status_;
+    AbandonOutcome abandon_outcome_ = AbandonOutcome::kQuiescentRecoverable;
+    int abandon_calls_ = 0;
 };
 
 namespace {
@@ -312,6 +343,130 @@ TEST(BatchRetirementTest, TransportCleanupWaitsForCallbacks) {
 
     batch.active_completion_callbacks.fetch_sub(1, std::memory_order_acq_rel);
     EXPECT_TRUE(probe->freeBatchID(batch_id).ok());
+}
+
+// A recoverable abandon proves that no access is in flight, so retirement is
+// published and the caller may free the batch.
+TEST(BatchRetirementTest, AbandonRecoverablePublishesTerminalState) {
+    std::string local_server_name = "abandon-recoverable-test";
+    MultiTransport transports(nullptr, local_server_name);
+    auto probe = std::make_shared<AbandonProbeTransport>();
+    const BatchID batch_id = transports.allocateBatchID(1);
+    ASSERT_TRUE(probe->submitTransfer(batch_id, makeRequests(2)).ok());
+
+    Transport::AbandonOutcome outcome = Transport::AbandonOutcome::kNotQuiescent;
+    const Status status = transports.abandonBatch(
+        batch_id, std::chrono::milliseconds(50), outcome);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(outcome, Transport::AbandonOutcome::kQuiescentRecoverable);
+    EXPECT_EQ(probe->abandonCalls(), 1);
+
+    // The abandoned task reports its failure status, but retirement proves the
+    // buffers are safe and the batch can be freed.
+    bool retired = false;
+    const Status retired_status =
+        transports.getBatchRetirementStatus(batch_id, retired);
+    EXPECT_FALSE(retired_status.ok()) << retired_status.ToString();
+    EXPECT_TRUE(retired);
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+// A device fault stops the batch but proves nothing about buffer safety: the
+// batch must stay pending so the caller shuts the engine down instead of
+// releasing borrowed buffers.
+TEST(BatchRetirementTest, AbandonDeviceFaultKeepsBatchPending) {
+    std::string local_server_name = "abandon-device-fault-test";
+    MultiTransport transports(nullptr, local_server_name);
+    auto probe = std::make_shared<AbandonProbeTransport>();
+    probe->setAbandonResult(Status::OK(),
+                            Transport::AbandonOutcome::kQuiescentDeviceFault);
+    const BatchID batch_id = transports.allocateBatchID(1);
+    ASSERT_TRUE(probe->submitTransfer(batch_id, makeRequests(2)).ok());
+
+    Transport::AbandonOutcome outcome = Transport::AbandonOutcome::kNotQuiescent;
+    const Status status = transports.abandonBatch(
+        batch_id, std::chrono::milliseconds(50), outcome);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(outcome, Transport::AbandonOutcome::kQuiescentDeviceFault);
+
+    bool retired = true;
+    EXPECT_TRUE(transports.getBatchRetirementStatus(batch_id, retired).ok());
+    EXPECT_FALSE(retired);
+    EXPECT_EQ(transports.freeBatchID(batch_id).code(),
+              Status::Code::kBatchBusy);
+
+    // Finish the fake transfer so the test does not leak the batch handle.
+    auto& batch = Transport::toBatchDesc(batch_id);
+    for (auto* slice : batch.task_list[0].slice_list) slice->markSuccess();
+    EXPECT_TRUE(transports.getBatchRetirementStatus(batch_id, retired).ok());
+    EXPECT_TRUE(retired);
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+// A transport without the capability cannot prove safety; the generic layer
+// must report kNotQuiescent and keep the batch pending.
+TEST(BatchRetirementTest, AbandonUnsupportedTransportKeepsBatchPending) {
+    std::string local_server_name = "abandon-unsupported-test";
+    MultiTransport transports(nullptr, local_server_name);
+    auto probe = std::make_shared<RetirementProbeTransport>();
+    const BatchID batch_id = transports.allocateBatchID(1);
+    ASSERT_TRUE(probe->submitTransfer(batch_id, makeRequests(2)).ok());
+
+    Transport::AbandonOutcome outcome = Transport::AbandonOutcome::kQuiescentRecoverable;
+    const Status status = transports.abandonBatch(
+        batch_id, std::chrono::milliseconds(50), outcome);
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(outcome, Transport::AbandonOutcome::kNotQuiescent);
+
+    bool retired = true;
+    EXPECT_TRUE(transports.getBatchRetirementStatus(batch_id, retired).ok());
+    EXPECT_FALSE(retired);
+
+    auto& batch = Transport::toBatchDesc(batch_id);
+    for (auto* slice : batch.task_list[0].slice_list) slice->markSuccess();
+    EXPECT_TRUE(transports.getBatchRetirementStatus(batch_id, retired).ok());
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+// A give-up terminal state retires the batch but must not be advertised as
+// safe to release.
+TEST(BatchRetirementTest, NonQuiescentRetirementIsReported) {
+    std::string local_server_name = "non-quiescent-test";
+    MultiTransport transports(nullptr, local_server_name);
+    auto probe = std::make_shared<NonQuiescentProbeTransport>();
+    const BatchID batch_id = transports.allocateBatchID(1);
+    ASSERT_TRUE(probe->submitTransfer(batch_id, makeRequests(2)).ok());
+    auto& batch = Transport::toBatchDesc(batch_id);
+    for (auto* slice : batch.task_list[0].slice_list) slice->markSuccess();
+
+    bool retired = false;
+    bool quiescent = true;
+    const Status status =
+        transports.getBatchRetirementStatus(batch_id, retired, quiescent);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_TRUE(retired);
+    EXPECT_FALSE(quiescent);
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+// A confirmed stop is reported as quiescent.
+TEST(BatchRetirementTest, QuiescentRetirementIsReported) {
+    std::string local_server_name = "quiescent-test";
+    MultiTransport transports(nullptr, local_server_name);
+    auto probe = std::make_shared<RetirementProbeTransport>();
+    const BatchID batch_id = transports.allocateBatchID(1);
+    ASSERT_TRUE(probe->submitTransfer(batch_id, makeRequests(2)).ok());
+    auto& batch = Transport::toBatchDesc(batch_id);
+    for (auto* slice : batch.task_list[0].slice_list) slice->markSuccess();
+
+    bool retired = false;
+    bool quiescent = false;
+    const Status status =
+        transports.getBatchRetirementStatus(batch_id, retired, quiescent);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_TRUE(retired);
+    EXPECT_TRUE(quiescent);
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
 }
 
 }  // namespace mooncake

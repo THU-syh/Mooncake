@@ -289,6 +289,14 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+    // Library-owned verdict: `retired` may come from a give-up; `quiescent`
+    // says whether the transport proved that no access is in flight.
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired);
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired,
+                                    bool& quiescent);
+    Status abandonBatch(BatchID batch_id, std::chrono::milliseconds timeout,
+                        Transport::AbandonOutcome& outcome);
+
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);

@@ -216,6 +216,9 @@ void AsyncTransferExecutor::markBatchFailed(QueryBatch& batch,
         LOG(ERROR) << reason;
     }
     for (auto* slice : batch.slices) {
+        if (slice->ascend_direct.handle != nullptr) {
+            slice->ascend_direct.unsafe_terminal = true;
+        }
         slice->markFailed();
     }
     handleTaskFinished();

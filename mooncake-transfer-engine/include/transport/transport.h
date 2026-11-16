@@ -277,6 +277,9 @@ class Transport {
                 void *handle;
                 int64_t start_time;
                 int32_t engine_id;
+                // Terminal state came from a timeout/abort that could not prove
+                // the transfer stopped: never treat it as safe to release.
+                bool unsafe_terminal;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;

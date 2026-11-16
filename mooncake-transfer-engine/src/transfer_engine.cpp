@@ -303,6 +303,23 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
     return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    bool quiescent = false;
+    return getBatchRetirementStatus(batch_id, retired, quiescent);
+}
+
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id, bool& retired,
+                                                bool& quiescent) {
+    return impl_->getBatchRetirementStatus(batch_id, retired, quiescent);
+}
+
+Status TransferEngine::abandonBatch(BatchID batch_id,
+                                    std::chrono::milliseconds timeout,
+                                    Transport::AbandonOutcome& outcome) {
+    return impl_->abandonBatch(batch_id, timeout, outcome);
+}
+
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     stats.clear();
     return Status::OK();
@@ -1072,6 +1089,44 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
     } else
         return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    bool quiescent = false;
+    return getBatchRetirementStatus(batch_id, retired, quiescent);
+}
+
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id, bool& retired,
+                                                bool& quiescent) {
+    if (!use_tent_) {
+        return impl_->getBatchRetirementStatus(batch_id, retired, quiescent);
+    }
+    retired = false;
+    quiescent = false;
+    TransferStatus status;
+    auto queried = getBatchTransferStatus(batch_id, status);
+    if (!queried.ok()) return queried;
+    retired = status.s == TransferStatusEnum::COMPLETED;
+    // TENT only certifies COMPLETED; cached failure/timeout is not a proof.
+    quiescent = retired;
+    if (status.s == TransferStatusEnum::FAILED ||
+        status.s == TransferStatusEnum::TIMEOUT ||
+        status.s == TransferStatusEnum::CANCELED) {
+        return Status::Context("Transfer batch failed, state=" +
+                               std::to_string(static_cast<int>(status.s)));
+    }
+    return Status::OK();
+}
+
+Status TransferEngine::abandonBatch(BatchID batch_id,
+                                    std::chrono::milliseconds timeout,
+                                    Transport::AbandonOutcome& outcome) {
+    if (!use_tent_) return impl_->abandonBatch(batch_id, timeout, outcome);
+    (void)batch_id;
+    (void)timeout;
+    outcome = Transport::AbandonOutcome::kNotQuiescent;
+    return Status::NotImplemented("TENT does not expose batch quiescence");
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
