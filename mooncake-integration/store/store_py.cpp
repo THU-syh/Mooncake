@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -35,6 +36,30 @@ namespace py = pybind11;
 
 namespace mooncake {
 namespace {
+
+// Keep the public Python exception hierarchy compatible with callers that
+// already catch RuntimeError, while allowing callers to handle transient
+// Store availability failures separately from other Store errors.
+class StoreError : public std::runtime_error {
+   public:
+    using std::runtime_error::runtime_error;
+};
+
+class StoreUnavailableError : public StoreError {
+   public:
+    using StoreError::StoreError;
+};
+
+class StoreGetError : public StoreError {
+   public:
+    using StoreError::StoreError;
+};
+
+bool is_transient_get_error(ErrorCode error) {
+    return error == ErrorCode::RPC_FAIL ||
+           error == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+           error == ErrorCode::REPLICA_IS_NOT_READY;
+}
 
 struct PyTensorInfo {
     uintptr_t data_ptr;
@@ -471,38 +496,70 @@ class MooncakeStorePyWrapper {
 
     pybind11::bytes get(const std::string &key) {
         if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return pybind11::bytes("\\0", 0);
+            throw std::runtime_error(
+                "Mooncake Store client is not initialized");
         }
 
         const auto kNullString = pybind11::bytes("\\0", 0);
+        std::shared_ptr<BufferHandle> buffer_handle;
+        ErrorCode get_error = ErrorCode::OK;
 
         {
             py::gil_scoped_release release_gil;
-            auto buffer_handle = store_->get_buffer(key);
-            if (!buffer_handle) {
-                py::gil_scoped_acquire acquire_gil;
+            if (real_client_) {
+                auto result = real_client_->get_buffer_with_status(key);
+                if (result) {
+                    buffer_handle = std::move(result.value());
+                } else {
+                    get_error = result.error();
+                }
+            } else {
+                buffer_handle = store_->get_buffer(key);
+                if (!buffer_handle) {
+                    const int exists = store_->isExist(key);
+                    get_error =
+                        exists == 0
+                            ? ErrorCode::OBJECT_NOT_FOUND
+                            : (exists < 0
+                                   ? ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS
+                                   : ErrorCode::INTERNAL_ERROR);
+                }
+            }
+        }
+
+        if (!buffer_handle) {
+            if (get_error == ErrorCode::OBJECT_NOT_FOUND) {
                 return kNullString;
             }
-
-            py::gil_scoped_acquire acquire_gil;
-            auto runtime_accelerator =
-                mooncake::device::GetAcceleratorRegistry()
-                    .RuntimeAccelerators();
-            if (runtime_accelerator.FindDeviceForPointer(
-                    buffer_handle->ptr())) {
-                std::string host_buf(buffer_handle->size(), '\0');
-                if (!runtime_accelerator.CopyToHost(host_buf.data(),
-                                                    buffer_handle->ptr(),
-                                                    buffer_handle->size())) {
-                    LOG(ERROR) << "Failed to copy buffer to host memory";
-                    return pybind11::none();
-                }
-                return pybind11::bytes(host_buf);
+            const auto error_details =
+                toString(get_error) +
+                " (code=" + std::to_string(static_cast<int>(get_error)) + ")";
+            if (is_transient_get_error(get_error)) {
+                throw StoreUnavailableError(
+                    "Mooncake Store GET could not determine whether key '" +
+                    key + "' exists: " + error_details +
+                    ". This is not a confirmed OBJECT_NOT_FOUND; the key's "
+                    "existence is unknown. A master HA rebuild or failover "
+                    "may be in progress.");
             }
-            return pybind11::bytes((char *)buffer_handle->ptr(),
-                                   buffer_handle->size());
+            throw StoreGetError("Mooncake Store GET for key '" + key +
+                                "' failed: " + error_details + ".");
         }
+
+        auto runtime_accelerator =
+            mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
+        if (runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
+            std::string host_buf(buffer_handle->size(), '\0');
+            if (!runtime_accelerator.CopyToHost(host_buf.data(),
+                                                buffer_handle->ptr(),
+                                                buffer_handle->size())) {
+                LOG(ERROR) << "Failed to copy buffer to host memory";
+                return pybind11::none();
+            }
+            return pybind11::bytes(host_buf);
+        }
+        return pybind11::bytes((char *)buffer_handle->ptr(),
+                               buffer_handle->size());
     }
 
     std::vector<pybind11::bytes> get_batch(
@@ -1804,6 +1861,13 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    auto store_error =
+        py::register_exception<StoreError>(m, "StoreError", PyExc_RuntimeError);
+    py::register_exception<StoreUnavailableError>(m, "StoreUnavailableError",
+                                                  store_error.ptr());
+    py::register_exception<StoreGetError>(m, "StoreGetError",
+                                          store_error.ptr());
+
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");

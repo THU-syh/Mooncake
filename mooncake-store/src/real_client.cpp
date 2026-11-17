@@ -46,7 +46,6 @@ DEFINE_bool(enable_http_server, false,
 DEFINE_int32(http_port, 9300,
              "Port for client HTTP server "
              "(only effective when --enable_http_server=true).");
-
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
@@ -2617,33 +2616,42 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 // Implementation of get_buffer_internal method
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    ErrorCode *failure_reason) {
+    auto fail = [failure_reason](ErrorCode error) {
+        if (failure_reason) {
+            *failure_reason = error;
+        }
+        return std::shared_ptr<BufferHandle>{};
+    };
+    if (failure_reason) {
+        *failure_reason = ErrorCode::INTERNAL_ERROR;
+    }
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
-        return nullptr;
+        return fail(ErrorCode::INVALID_PARAMS);
     }
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
-        return nullptr;
+        return fail(ErrorCode::INVALID_PARAMS);
     }
 
     // Query the object info
     auto query_result = client_->Query(key);
     if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
-            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            return nullptr;
+        const ErrorCode error = query_result.error();
+        if (error != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Query failed for key: " << key
+                       << " with error: " << toString(error);
         }
-        LOG(ERROR) << "Query failed for key: " << key
-                   << " with error: " << toString(query_result.error());
-        return nullptr;
+        return fail(error);
     }
 
     const std::vector<Replica::Descriptor> &replica_list =
         query_result.value().replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
-        return nullptr;
+        return fail(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     // Select best replica: prefer local MEMORY, then any MEMORY,
@@ -2654,21 +2662,21 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
-        return nullptr;
+        return fail(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
-        return nullptr;
+        return fail(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     // Allocate buffer
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
-        return nullptr;
+        return fail(ErrorCode::INTERNAL_ERROR);
     }
 
     auto buffer_handle =
@@ -2686,7 +2694,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
-            return nullptr;
+            return fail(read_result.error());
+        }
+        if (failure_reason) {
+            *failure_reason = ErrorCode::OK;
         }
         return buffer_handle;
     }
@@ -2711,22 +2722,38 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
-        return nullptr;
+        return fail(get_result.error());
     }
 
+    if (failure_reason) {
+        *failure_reason = ErrorCode::OK;
+    }
     return buffer_handle;
 }
 
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
-    return execute_timed_operation<std::shared_ptr<BufferHandle>>(
-        [&]() { return get_buffer_internal(key, client_buffer_allocator_); },
-        [](const auto &buffer) { return buffer != nullptr; },
-        [&](uint64_t latency_us, const auto &buffer) {
-            client_->ObserveTransferOperation(TransferOperationKind::kRead,
-                                              "get_buffer", buffer->size(),
-                                              latency_us);
-        });
+    auto result = get_buffer_with_status(key);
+    return result ? std::move(result.value()) : nullptr;
+}
+
+tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>
+RealClient::get_buffer_with_status(const std::string &key) {
+    if (!client_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto start_time = std::chrono::steady_clock::now();
+    ErrorCode get_error = ErrorCode::INTERNAL_ERROR;
+    auto buffer =
+        get_buffer_internal(key, client_buffer_allocator_, &get_error);
+    if (buffer) {
+        client_->ObserveTransferOperation(TransferOperationKind::kRead,
+                                          "get_buffer", buffer->size(),
+                                          elapsed_us_since(start_time));
+        return buffer;
+    }
+    return tl::make_unexpected(get_error);
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
