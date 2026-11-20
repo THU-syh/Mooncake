@@ -84,7 +84,6 @@ void BatchRetirementReaper::run() {
             if (stopping_) {
                 break;
             }
-            const auto now = std::chrono::steady_clock::now();
             for (auto it = pending_.begin(); it != pending_.end();) {
                 Completion completion;
                 if (advance(*it, completion)) {
@@ -149,20 +148,18 @@ bool BatchRetirementReaper::advance(PendingBatch& batch,
         batch.first_error = query_status;
     }
 
-    if (retired && !quiescent) {
-        completion.batch_id = batch.batch_id;
-        completion.callback = std::move(batch.callback);
-        completion.status =
-            batch.first_error.ok()
-                ? Status::Context(
-                      "Mooncake batch retired without quiescence proof")
-                : batch.first_error;
-        completion.state = BatchRetirementState::kUnrecoverable;
-        return true;
-    }
-
     if (!retired) {
         return false;
+    }
+
+    // Retirement proves every slice is terminal, so the batch may be freed
+    // even when the transport could not prove the hardware stopped. The state
+    // still reports the missing proof so a caller that cannot tolerate a late
+    // write can choose to restart; the owning policy decides what to do.
+    const bool unsafe = !quiescent;
+    if (unsafe && batch.first_error.ok()) {
+        batch.first_error =
+            Status::Context("Mooncake batch retired without quiescence proof");
     }
 
     const Status freed = free_batch_(batch.batch_id);
@@ -173,19 +170,22 @@ bool BatchRetirementReaper::advance(PendingBatch& batch,
         if (++batch.cleanup_failures < kCleanupRetryAttempts) {
             return false;
         }
-        // Quiescence is proven, so the buffers are safe even when the batch
-        // descriptor could not be cleaned up; report the cleanup error.
+        // Retirement made the batch freeable; if the descriptor still cannot
+        // be cleaned up, report the cleanup error rather than retrying
+        // forever. The quiescence state is preserved in the completion.
         completion.batch_id = batch.batch_id;
         completion.callback = std::move(batch.callback);
         completion.status = freed;
-        completion.state = BatchRetirementState::kSafeToRelease;
+        completion.state = unsafe ? BatchRetirementState::kUnrecoverable
+                                  : BatchRetirementState::kSafeToRelease;
         return true;
     }
 
     completion.batch_id = batch.batch_id;
     completion.callback = std::move(batch.callback);
     completion.status = batch.first_error;
-    completion.state = BatchRetirementState::kSafeToRelease;
+    completion.state = unsafe ? BatchRetirementState::kUnrecoverable
+                              : BatchRetirementState::kSafeToRelease;
     return true;
 }
 

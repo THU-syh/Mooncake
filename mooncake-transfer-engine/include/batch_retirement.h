@@ -43,8 +43,9 @@ enum class BatchRetirementState {
     // The transport proved it stopped touching the buffers; they may be
     // released, and the batch ID has been freed by the reaper.
     kSafeToRelease,
-    // No quiescence proof: the owner must not release anything and should
-    // restart the engine instead.
+    // No quiescence proof: the batch was freed when it retired, otherwise the
+    // descriptor remains allocated. The owner decides whether to fail the
+    // request or restart; reused buffers must not be trusted to stay untouched.
     kUnrecoverable,
 };
 

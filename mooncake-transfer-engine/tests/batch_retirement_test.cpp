@@ -522,6 +522,47 @@ TEST(BatchRetirementTest, AsyncReleasesOnlyAfterQuiescentRetirement) {
     EXPECT_EQ(frees.load(), 1);
 }
 
+// Retirement alone is enough to free the batch. Missing quiescence proof is
+// still reported as kUnrecoverable, but it no longer leaves the descriptor
+// allocated.
+TEST(BatchRetirementTest, AsyncFreesRetiredBatchWithoutQuiescence) {
+    std::atomic<int> frees{0};
+    std::promise<BatchRetirementState> done;
+    BatchRetirementOptions options;
+    options.abandon_delay = std::chrono::seconds(10);
+    options.deadline = std::chrono::seconds(5);
+
+    BatchRetirementReaper reaper(
+        [](BatchID, bool& retired, bool& quiescent) {
+            retired = true;
+            quiescent = false;
+            return Status::OK();
+        },
+        [](BatchID, std::chrono::milliseconds,
+           Transport::AbandonOutcome& outcome) {
+            outcome = Transport::AbandonOutcome::kNotQuiescent;
+            return Status::OK();
+        },
+        [&](BatchID) {
+            ++frees;
+            return Status::OK();
+        });
+
+    ASSERT_TRUE(reaper
+                    .enqueue(10, options,
+                             [&](BatchID, const Status& status,
+                                 BatchRetirementState state) {
+                                 EXPECT_FALSE(status.ok());
+                                 done.set_value(state);
+                             })
+                    .ok());
+    auto future = done.get_future();
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(future.get(), BatchRetirementState::kUnrecoverable);
+    EXPECT_EQ(frees.load(), 1);
+}
+
 // A caller that already saw a failure asks for an immediate abandon; a
 // recoverable outcome must still end in a safe release.
 TEST(BatchRetirementTest, AsyncAbandonsImmediatelyAndReleases) {
